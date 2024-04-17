@@ -1,0 +1,1173 @@
+---
+title: "Accurate evaluation of live-virus microneutralization for SARS-CoV-2 variant JN.1"
+short-title: ""
+editor: visual
+format: 
+  docx:
+    toc: false
+    number-sections: true
+    toc-title: Contents
+    fig-width: 8
+    fig-height: 9
+    execute:
+     cache: true
+     echo: false
+     warning: false
+include-in-header: 
+  text: |
+        \usepackage{caption}
+        \usepackage{mdframed}
+knitr: 
+  opts_chunk:
+    dev: ragg_png
+    dpi: 300
+---
+
+```{r}
+#| echo: false
+#| label: session_prep
+#| warning: false
+#| message: false
+#| cache: false
+
+library(tidyverse)
+library(patchwork)
+library(ragg)
+library(rstatix)
+library(ggpubr)
+library(boot)
+library(lubridate) ## year() is used
+
+```
+
+<!-- # Functions  -->
+
+```{r}
+#| label: functions
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+
+#----------------------------------------------#
+## ggplot scaling                           ####
+#----------------------------------------------#
+
+scale_y_nAb_ds10 <- function(lower_floor=1,upper_floor=2,no=5,weak=10,compl=80000,y_lab = bquote('\nVirus Neutralisation,'~IC[50]~''),...) {
+  scale_y_continuous(trans='log2',
+                     limits = c(no - lower_floor, compl * upper_floor),
+                     breaks=c(no, weak, 64, 256, 1024, 4096, 16384, compl),
+                     labels=c("[0]", "[<40]", "64", "256", "1024", "4096", "16000", "[>80000]"),
+                     minor_breaks=c(24, 128, 512, 2048, 8192, 32768),
+                     name = y_lab,
+                     ...)
+  
+}
+
+scale_x_nAb_ds10 <- function(lower_floor=1,upper_floor=2,no=5,weak=10,compl=80000, x_lab = bquote('\nVirus Neutralisation,'~IC[50]~''),...) {
+  scale_x_continuous(trans='log2',
+                     limits = c(no - lower_floor, compl * upper_floor),
+                     breaks=c(no, weak, 64, 256, 1024, 4096, 16384, compl),
+                     labels=c("[0]", "[<40]", "64", "256", "1024", "4096", "16000", "[>80000]"),
+                     minor_breaks=c(24, 128, 512, 2048, 8192, 32768),
+                     name = x_lab,
+                     ...)
+  
+}
+
+#----------------------------------------------#
+## Unpaired fold change                     ####
+#----------------------------------------------#
+
+# subset_FC() - calculates the unpaired fold change on a sub-sample of the data
+# unpaired_FC() - wrapper, applies subset_FC() using the boot::boot() function for bootstrapping and summarises the output
+subset_FC <- function(groups,data,indices,min,max){
+  
+  d <- data[indices,] 
+  
+  d[which(d$nAb<=min|d$nAb>=max),"nAb"] <- NA
+  
+  num <- median(pull(d[d$cohort==groups[2],"nAb"]),na.rm = T)
+  denom <- median(pull(d[d$cohort==groups[1],"nAb"]),na.rm = T)
+  
+  fc <- num/denom
+  
+  return(fc)
+}
+unpaired_FC <- function(df,
+                        num,
+                        denom,
+                        y,
+                        ci_type=NULL,
+                        rpts=5000,
+                        min=40,
+                        max=80000,
+                        seed_no = 10){
+  
+  # Median by group
+  output <- df %>%
+    filter(variant==y,cohort %in% c(denom,num)) %>%
+    group_by(cohort) %>%
+    summarise(median=median(nAb,na.rm=T)) %>%
+    ungroup() %>%
+    pivot_wider(names_from = cohort,
+                values_from = median)
+  
+  # Add variant name
+  output <- cbind(data.frame("variant"=y),output)
+  
+  # Get bootstrapped FC
+  set.seed(seed_no)
+  results <- boot(data=df %>% filter(variant==y),
+                  statistic= subset_FC,
+                  R=rpts,
+                  groups=c(denom,num),
+                  min = min,
+                  max = max)
+  output$med <- results$t0
+  
+  # CI
+  if(is.null(ci_type)){
+     results_ci <- boot.ci(results, type="basic")
+     output$lower_ci <- results_ci$basic[4]
+     output$upper_ci <- results_ci$basic[5]
+  } else{
+     results_ci <- boot.ci(results, type="bca")
+     output$lower_ci <- results_ci$bca[4]
+     output$upper_ci <- results_ci$bca[5]
+  }
+  
+  return(output)
+}
+
+
+#----------------------------------------------#
+## Paired fold change function           ####
+#----------------------------------------------#
+
+# paired_FC() - calculates the paired fold change using the infer::generate() function for bootstrapping and summarises the output
+paired_FC <- function(dat, 
+                      group_var = "cohort",
+                      num = "post",
+                      denom = "pre",
+                      y = "nAb",
+                      variant = "Ancestral",
+                      rpts=5000,
+                      seed_no = 10){
+
+  # Reformat input data and join 
+  dat.tmp <- left_join(
+    dat %>%
+      
+      # Ensure numeric
+      mutate_at(vars(starts_with("ic50")), as.numeric) %>% 
+      
+      # Rows containing selected variant and group
+      filter(variant == !!rlang::enquo(variant), !!rlang::ensym(group_var) == !!rlang::enquo(num)) %>% 
+      
+      # Select and rename y data as numerator
+      select(elig_study_id, variant, num = !!rlang::enquo(y)),
+    
+    dat %>%
+      
+      # Ensure numeric
+      mutate_at(vars(starts_with("ic50")), as.numeric) %>% 
+      
+      # Rows containing selected variant and group
+      filter(variant == !!rlang::enquo(variant),!!rlang::ensym(group_var) == !!rlang::enquo(denom)) %>% 
+
+      # Select and rename y data as denominator
+      select(elig_study_id,variant, denom = !!rlang::enquo(y)))
+    
+  # Calculate group medians
+  group_medians <- dat.tmp %>% 
+      summarise(num_median = median(num,na.rm=T),
+                denom_median = median(denom,na.rm=T))
+  
+  # Set seed
+  set.seed(seed_no)
+  
+  # Calculate paired FC with bootstrap resampling
+  
+  # Note: The maximum ic50 of the assay 80,000. To avoid artificially inflating the FC we set these to 40,000.
+  inferFC <- dat.tmp %>%
+    mutate(num = case_when(num >= 80000 ~ 40000,
+                           num <= 40 ~ 40,
+                           T ~ num),
+           denom = case_when(denom >= 80000 ~ 40000,
+                             num <= 40 ~ 40,
+                             T ~ denom),
+           Fold_ic50 = num/denom) %>%
+    infer::specify(response = Fold_ic50) %>%  
+    infer::generate(reps = rpts, type = "bootstrap") %>%
+    infer::calculate(stat = "median")
+  
+  # Summarise results
+  res <- data.frame(num = num,
+                    denom = denom,
+                    group_medians,
+                    Fold_ic50 = median(inferFC$stat),
+                    inferFC %>% infer::get_confidence_interval(level = 0.95))
+  
+  # Format for use in text/plots
+  res$text.label <- res %>%
+    mutate(across(where(is.numeric),round, 1)) %>%
+    mutate(label = paste0("FC ",Fold_ic50, " [",lower_ci, "-",upper_ci, "]")) %>% 
+    pull(label)
+  
+  res$label <- res %>%
+    mutate(across(where(is.numeric),round, 1)) %>%
+    mutate(label = paste0("FC=",Fold_ic50, "\n[",lower_ci, "-",upper_ci, "]")) %>% 
+    pull(label)
+  
+  return(res)
+}
+
+
+
+```
+
+<!-- # Parameters  -->
+
+```{r}
+#| label: parameters
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+
+
+strainOrder <- c("Ancestral",
+                 "BA.2.86",
+                "JN.1",
+                "JN.1_Caco.2_b2",
+                "JN.1_Vero.V1_b2")
+
+manual.pal <- 
+  c("#CC6677",
+    "#000080",
+    "#66A61E",
+    "lightgrey",
+    "lightgrey")
+    
+names(manual.pal) = strainOrder
+    
+pd <- position_dodge(0.4)
+
+global_size = 10
+
+rpts = 5000
+
+
+```
+
+<!-- # Import pre-processed chronogram  -->
+
+```{r}
+#| label: Import_pre-processed_chronogram 
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+#| cache: false
+load("./Legacy_live_virus_microneutralization_for_SARS_CoV_2_variant_JN1_20240417_PUBLIC.RData")
+
+```
+
+<!-- ########################################### -->
+
+<!-- ## Figure 2a: Pre vs Post unpaired -->
+
+```{r}
+#| label: figure_2a_pre_vs_post_unpaired
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+#| 
+
+dat <- rbind(pre.all, post.all)
+
+df <- dat %>%
+  
+  # Ensure numeric 
+  mutate(across(ends_with("ds10") & starts_with("ic50"),  ~ as.numeric(.x) )) %>%
+  
+  ## Long format
+  pivot_longer(ends_with("ds10") & starts_with("ic50"),
+               values_to = "nAb",
+               names_to = "variant") %>% 
+  
+  # Tidy variant names
+  mutate(variant = str_remove(variant,"_ds10"),
+         variant = str_remove(variant,"ic50_"),
+         variant = str_replace(variant, pattern = "Omicron_BA", replacement = "BA."),
+         variant = str_replace(variant, pattern = "wildtype", replacement = "Ancestral"),
+         variant = factor(variant,levels= strainOrder)) %>% 
+  
+  # Tidy / reorder group and facet labels
+  mutate(cohort = factor(cohort, levels = c("pre.all", "post.all"),labels = c("pre", "post")),
+         dose_5 = factor(dose_5,levels=c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"))) %>%
+  
+  # Remove NA's
+  filter(!is.na(nAb)) %>% 
+  filter(grepl("_b2$",variant)==F,
+         !is.na(variant))
+
+# Statistical tests
+stat.test <- df %>%
+  
+  # Wilcox tests per facet
+  arrange(elig_study_id) %>% 
+  group_by(variant,dose_5) %>%
+  rstatix::wilcox_test(nAb ~ cohort, paired = F)%>%
+  ungroup() %>% 
+  
+  # Format for plot 
+  adjust_pvalue(method = "holm") %>%
+  add_significance() %>%
+  add_xy_position(x = "cohort",fun="median") %>% 
+  mutate(p.lab = format(round(p,3),ns=3),
+         p.lab = gsub("0.000","<0.001",p.lab))
+
+# Generate plot
+gg<-df %>% 
+  ggplot(aes(x = cohort, y = nAb, group = elig_study_id,  col = variant)) +
+  geom_violin(aes(x = cohort,group=cohort),fill=NA)+
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  scale_y_nAb_ds10(upper_floor = 4) +
+  scale_color_manual(values = manual.pal, drop = T) +
+  # Add median
+  stat_summary(aes(group=NULL), geom = "point", shape = 5, size = 2, col = "black",fun = "median") +
+  # Add pre-calculated P values
+  stat_pvalue_manual(stat.test,y.position = 17,label = "p.lab",tip.length = 0.03)+
+  # Facet by variant and vaccine type
+  facet_grid(cols=vars(variant),rows=vars(dose_5)) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        legend.position="none") +
+  labs(x = "Sampling relative to dose 5")
+
+# Vector of variants & vaccines for FC calculations
+variants <- names(table(gg$data$variant)[table(gg$data$variant)!=0])
+vax <- names(table(gg$data$dose_5)[table(gg$data$dose_5)!=0])
+
+# Comparison groups 
+num = "post"
+denom = "pre"
+
+# Loop through each vax & variant
+FC.ci <- list()
+for(v in vax){
+  for(j in 1:length(variants)){
+    y = variants[j]
+    FC.ci[[v]][[j]]<- unpaired_FC(df = df %>% filter(dose_5 == v),denom = denom,num=num,y=y,rpts = rpts, ci_type="bca")
+    FC.ci[[v]][[j]]$group2 = num
+    FC.ci[[v]][[j]]$group1 = denom
+    FC.ci[[v]][[j]]$dose_5 = v
+  }
+}
+FC.ci <- bind_rows(FC.ci)
+colnames(FC.ci) <- gsub(num,"group2_nAb",colnames(FC.ci))
+colnames(FC.ci) <- gsub(denom,"group1_nAb",colnames(FC.ci))
+
+# Add stat tests
+FC.ci <- full_join(FC.ci,stat.test)
+
+# Format for plotting 
+FC.labs <- FC.ci %>%
+  ## round to 1 dp ##
+  mutate(across(where(is.numeric),round, 1)) %>%
+  mutate(label = paste0("FC=",med, "\n[",lower_ci, "-",upper_ci, "]"))  %>%
+  mutate(text.label = paste0("FC ",med, " [",lower_ci, "-",upper_ci, "]"))  %>%
+  mutate(x = 1.5) %>%
+  mutate(y.position = 15) %>% 
+  mutate(elig_study_id = NA) %>% 
+  mutate(variant = factor(variant,levels= strainOrder,ordered = T),
+         dose_5 = factor(dose_5,levels=c("BNT162b2+BA4/5","BNT162b2-XBB.1.5")))
+
+
+# Add to plot
+panel_pre_vs_post <- gg + geom_text(data= FC.labs %>% filter(n1>10),
+               aes(x=x, y=y.position, label=label),
+               col="black",
+               size = 8/ggplot2::.pt)
+
+```
+
+<!-- ## Figure 2b: Pre - monovalent vs bivalent -->
+
+```{r}
+#| label: figure_2b_pre_monovalent_vs_bivalent
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+
+
+# Faceting by time point (pre/post cohort) and comparing samples by vaccine type (dose_5)
+dat <- rbind(pre.all,post.all) %>%
+  rowwise() %>% 
+  mutate(cohort = case_when(str_detect(cohort, "pre") ~"pre", str_detect(cohort, "post") ~"post"),
+         time_group = cohort,
+         cohort = case_when(dose_5 == "BNT162b2-XBB.1.5" ~ dose_5,dose_5 == "BNT162b2+BA4/5" ~ dose_5)) 
+
+df <- dat %>%
+  
+  # Filter to pre dose only 
+  filter(time_group == "pre") %>%
+  
+  # Ensure numeric 
+  mutate(across(ends_with("ds10") & starts_with("ic50"),  ~ as.numeric(.x) )) %>%
+  
+  ## Long format
+  pivot_longer(ends_with("ds10") & starts_with("ic50"),
+               values_to = "nAb",
+               names_to = "variant") %>% 
+  
+  # Tidy variant names
+  mutate(variant = str_remove(variant,"_ds10"),
+         variant = str_remove(variant,"ic50_"),
+         variant = str_replace(variant, pattern = "Omicron_BA", replacement = "BA."),
+         variant = str_replace(variant, pattern = "wildtype", replacement = "Ancestral"),
+         variant = factor(variant,levels= strainOrder,ordered = T)) %>% 
+  
+  # Tidy / reorder group and facet labels
+  mutate(cohort = factor(cohort, levels = c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"),labels=c("BNT162b2_BA4/5","BNT162b2-XBB.1.5")),
+         time_group = factor(time_group, levels = c("pre","post"),ordered = T)) %>%
+  
+  # Remove NA's
+  filter(!is.na(nAb))  %>% 
+  
+  filter(grepl("_b2$",variant)==F,
+         !is.na(variant))
+
+# Statistical tests
+stat.test <- df %>%
+  
+  # wilcox test per facet
+  group_by(variant,time_group) %>%
+  rstatix::wilcox_test(nAb ~ cohort,paired = F,ref.group = "BNT162b2_BA4/5")%>%
+  ungroup() %>% 
+  
+  # Format for plotting
+  adjust_pvalue(method = "holm") %>%
+  add_significance() %>%
+  add_xy_position(x = "cohort",fun="median") %>% 
+  mutate(p.lab = format(round(p,3),ns=3),
+         p.lab = gsub("0.000","<0.001",p.lab))
+
+# Plot
+gg<-df %>% 
+  ggplot(aes(x = cohort, y = nAb, group = elig_study_id,  col = variant)) +
+  geom_violin(aes(x = cohort,group=cohort),fill=NA)+
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  scale_y_nAb_ds10(upper_floor = 4) +
+  scale_color_manual(values = manual.pal, drop = T) +
+  theme_bw() + 
+  # Add median
+  stat_summary(aes(group=NULL), geom = "point", shape = 5, size = 2, col = "black",fun = "median") +
+  # Add pre-calculated P values
+  stat_pvalue_manual(stat.test,y.position = 17,label = "p.lab",tip.length = 0.03)+
+  # Facet by variant and time group
+  facet_grid(cols=vars(variant),rows=vars(time_group)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        legend.position="none") +
+  labs(x = "Dose 5 vaccine")
+
+panel_ALL_pre_by_dose <-gg + scale_x_discrete(labels=c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"))
+
+```
+
+<!-- ## Figure 2b: Post - monovalent vs bivalent -->
+
+```{r}
+#| label: figure_2b_post_monovalent_vs_bivalent
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+#| 
+
+# Faceting by time point (pre/post cohort) and comparing samples by vaccine type (dose_5)
+dat <- rbind(pre.all,post.all) %>%
+  rowwise() %>% 
+  mutate(cohort = case_when(str_detect(cohort, "pre") ~"pre", str_detect(cohort, "post") ~"post"),
+         time_group = cohort,
+         cohort = case_when(dose_5 == "BNT162b2-XBB.1.5" ~ dose_5,dose_5 == "BNT162b2+BA4/5" ~ dose_5)) 
+
+df <- dat %>%
+  
+  # Filter to pre dose only 
+  filter(time_group == "post") %>%
+  
+  # Ensure numeric 
+  mutate(across(ends_with("ds10") & starts_with("ic50"),  ~ as.numeric(.x) )) %>%
+  
+  ## Long format
+  pivot_longer(ends_with("ds10") & starts_with("ic50"),
+               values_to = "nAb",
+               names_to = "variant") %>% 
+  
+  # Tidy variant names
+  mutate(variant = str_remove(variant,"_ds10"),
+         variant = str_remove(variant,"ic50_"),
+         variant = str_replace(variant, pattern = "Omicron_BA", replacement = "BA."),
+         variant = str_replace(variant, pattern = "wildtype", replacement = "Ancestral"),
+         variant = factor(variant,levels= strainOrder,ordered = T)) %>% 
+  
+  # Tidy / reorder group and facet labels
+  mutate(cohort = factor(cohort, levels = c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"),labels=c("BNT162b2_BA4/5","BNT162b2-XBB.1.5")),
+         time_group = factor(time_group, levels = c("pre","post"),ordered = T)) %>%
+  
+  # Remove NA's
+  filter(!is.na(nAb))  %>% 
+  
+  filter(grepl("_b2$",variant)==F,
+         !is.na(variant))
+
+# Statistical tests
+stat.test <- df %>%
+  
+  # wilcox test per facet
+  group_by(variant,time_group) %>%
+  rstatix::wilcox_test(nAb ~ cohort,paired = F,ref.group = "BNT162b2_BA4/5")%>%
+  ungroup() %>% 
+  
+  # Format for plotting
+  adjust_pvalue(method = "holm") %>%
+  add_significance() %>%
+  add_xy_position(x = "cohort",fun="median") %>% 
+  mutate(p.lab = format(round(p,3),ns=3),
+         p.lab = gsub("0.000","<0.001",p.lab))
+
+# Plot
+gg<-df %>% 
+  ggplot(aes(x = cohort, y = nAb, group = elig_study_id,  col = variant)) +
+  geom_violin(aes(x = cohort,group=cohort),fill=NA)+
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  scale_y_nAb_ds10(upper_floor = 4) +
+  scale_color_manual(values = manual.pal, drop = T) +
+  theme_bw() + 
+  # Add median
+  stat_summary(aes(group=NULL), geom = "point", shape = 5, size = 2, col = "black",fun = "median") +
+  # Add pre-calculated P values
+  stat_pvalue_manual(stat.test,y.position = 17,label = "p.lab",tip.length = 0.03)+
+  # Facet by variant and time group
+  facet_grid(cols=vars(variant),rows=vars(time_group)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        legend.position="none") +
+  labs(x = "Dose 5 vaccine")
+
+## Fold Change
+
+# Vector of variants & vaccines
+variants <- names(table(gg$data$variant)[table(gg$data$variant)!=0])
+time_groups <- names(table(gg$data$time_group)[table(gg$data$time_group)!=0])
+
+# Comparison groups 
+num = "BNT162b2-XBB.1.5"
+denom = "BNT162b2_BA4/5"
+
+# Loop through each vax & variant
+FC.ci <- list()
+for(v in time_groups){
+  for(j in 1:length(variants)){
+    y = variants[j]
+    FC.ci[[v]][[j]]<- unpaired_FC(df = df %>% filter(time_group == v),denom = denom,num=num,y=y,rpts = rpts,ci_type = "bca")
+    FC.ci[[v]][[j]]$group2 = num
+    FC.ci[[v]][[j]]$group1 = denom
+    FC.ci[[v]][[j]]$time_group = v
+  }
+}
+FC.ci <- bind_rows(FC.ci)
+colnames(FC.ci) <- gsub(num,"group2_nAb",colnames(FC.ci))
+colnames(FC.ci) <- gsub(denom,"group1_nAb",colnames(FC.ci))
+
+# Add other stats 
+FC.ci <- full_join(FC.ci,stat.test)
+
+FC.labs <- FC.ci %>%
+  ## round to 1 dp ##
+  mutate(across(where(is.numeric),round, 1)) %>%
+  mutate(label = paste0("FC=",med, "\n[",lower_ci, "-",upper_ci, "]"))  %>%
+  mutate(text.label = paste0("FC ",med, " [",lower_ci, "-",upper_ci, "]"))  %>%
+  mutate(x = 1.5) %>%
+  mutate(y.position = 15) %>% 
+  mutate(elig_study_id = NA) %>% 
+  mutate(variant = factor(variant,levels= strainOrder,ordered = T),
+         time_group = factor(time_group,levels= c("pre","post"),ordered = T))
+
+
+
+panel_ALL_post_by_dose <-gg + geom_text(data= FC.labs %>% 
+                      filter(n1>10,p<0.05),
+               aes(x=x, y=y.position, label=label),
+               col="black",
+               size = 8/ggplot2::.pt)+ scale_x_discrete(labels=c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"))
+```
+
+<!-- ########################################### -->
+
+<!-- ## Figure 3a: JN.1 repeats - pre vs Post unpaired -->
+
+```{r}
+#| label: figure_3a_JN1_repeats_pre_vs_post_unpaired
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+#| 
+dat <- rbind(pre.all, post.all)
+
+df <- dat %>%
+  
+  # Ensure numeric 
+  mutate(across(ends_with("ds10") & starts_with("ic50"),  ~ as.numeric(.x) )) %>%
+  
+  ## Long format
+  pivot_longer(ends_with("ds10") & starts_with("ic50"),
+               values_to = "nAb",
+               names_to = "variant") %>% 
+  
+  # Tidy variant names
+  mutate(variant = str_remove(variant,"_ds10"),
+         variant = str_remove(variant,"ic50_"),
+         variant = str_replace(variant, pattern = "Omicron_BA", replacement = "BA."),
+         variant = str_replace(variant, pattern = "wildtype", replacement = "Ancestral"),
+         variant = factor(variant,levels= strainOrder)) %>% 
+  
+  # Tidy / reorder group and facet labels
+  mutate(cohort = factor(cohort, levels = c("pre.all", "post.all"),labels = c("pre", "post")),
+         dose_5 = factor(dose_5,levels=c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"))) %>%
+  
+  # Remove NA's
+  filter(!is.na(nAb)) %>% 
+  
+  # Filt to JN.1 repeats
+  filter(grepl("JN.1",variant),
+         !is.na(variant)) %>% 
+  
+  # Tidy names to align with paper
+  mutate(variant = case_when(variant == "JN.1" ~ "JN.1_Caco.2_b1",T~variant),
+         variant = gsub("_"," ",variant),
+         variant = gsub("Vero.V1 b2","Vero V1",variant),
+         variant = gsub("Caco.2","Caco-2",variant),
+         variant = gsub(" b1","\n(repeat 1)",variant),
+         variant = gsub(" b2","\n(repeat 2)",variant))
+
+
+# Statistical tests
+stat.test <- df %>%
+  
+  # Wilcox tests per facet
+  arrange(elig_study_id) %>% 
+  group_by(variant,dose_5) %>%
+  rstatix::wilcox_test(nAb ~ cohort, paired = F)%>%
+  ungroup() %>% 
+  
+  # Format for plot 
+  adjust_pvalue(method = "holm") %>%
+  add_significance() %>%
+  add_xy_position(x = "cohort",fun="median") %>% 
+  mutate(p.lab = format(round(p,3),ns=3),
+         p.lab = gsub("0.000","<0.001",p.lab))
+
+# Generate plot
+gg<-df %>% 
+  ggplot(aes(x = cohort, y = nAb, group = elig_study_id,  col = variant)) +
+  geom_violin(aes(x = cohort,group=cohort),fill=NA)+
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  scale_y_nAb_ds10(upper_floor = 4) +
+  scale_color_manual(values = manual.pal, drop = T) +
+  # Add median
+  stat_summary(aes(group=NULL), geom = "point", shape = 5, size = 2, col = "black",fun = "median") +
+  # Add pre-calculated P values
+  stat_pvalue_manual(stat.test,y.position = 17,label = "p.lab",tip.length = 0.03)+
+  # Facet by variant and vaccine type
+  facet_grid(cols=vars(variant),rows=vars(dose_5)) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        legend.position="none") +
+  labs(x = "Sampling relative to dose 5")
+
+# Vector of variants & vaccines for FC calculations
+variants <- names(table(gg$data$variant)[table(gg$data$variant)!=0])
+vax <- names(table(gg$data$dose_5)[table(gg$data$dose_5)!=0])
+
+# Comparison groups 
+num = "post"
+denom = "pre"
+
+# Loop through each vax & variant
+FC.ci <- list()
+for(v in vax){
+  for(j in 1:length(variants)){
+    y = variants[j]
+    FC.ci[[v]][[j]]<- unpaired_FC(df = df %>% filter(dose_5 == v),denom = denom,num=num,y=y,rpts = rpts, ci_type="bca")
+    FC.ci[[v]][[j]]$group2 = num
+    FC.ci[[v]][[j]]$group1 = denom
+    FC.ci[[v]][[j]]$dose_5 = v
+  }
+}
+FC.ci <- bind_rows(FC.ci)
+colnames(FC.ci) <- gsub(num,"group2_nAb",colnames(FC.ci))
+colnames(FC.ci) <- gsub(denom,"group1_nAb",colnames(FC.ci))
+
+# Add stat tests
+FC.ci <- full_join(FC.ci,stat.test)
+
+# Format for plotting 
+FC.labs <- FC.ci %>%
+  ## round to 1 dp ##
+  mutate(across(where(is.numeric),round, 1)) %>%
+  mutate(label = paste0("FC=",med, "\n[",lower_ci, "-",upper_ci, "]"))  %>%
+  mutate(text.label = paste0("FC ",med, " [",lower_ci, "-",upper_ci, "]"))  %>%
+  mutate(x = 1.5) %>%
+  mutate(y.position = 15) %>% 
+  mutate(elig_study_id = NA) %>% 
+  mutate(variant = factor(variant,levels= levels(factor(df$variant)),ordered = T),
+         dose_5 = factor(dose_5,levels=c("BNT162b2+BA4/5","BNT162b2-XBB.1.5")))
+
+
+# Add to plot
+panel_JN1_pre_vs_post <- gg + geom_text(data= FC.labs %>% filter(n1>10),
+               aes(x=x, y=y.position, label=label),
+               col="black",
+               size = 8/ggplot2::.pt)
+
+```
+
+<!-- ## Figure 3b: JN.1 repeats - Pre - monovalent vs bivalent -->
+
+```{r}
+#| label: figure_3b_JN1_pre_monovalent_vs_bivalent
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+#| 
+# Faceting by time point (pre/post cohort) and comparing samples by vaccine type (dose_5)
+dat <- rbind(pre.all,post.all) %>%
+  rowwise() %>% 
+  mutate(cohort = case_when(str_detect(cohort, "pre") ~"pre", str_detect(cohort, "post") ~"post"),
+         time_group = cohort,
+         cohort = case_when(dose_5 == "BNT162b2-XBB.1.5" ~ dose_5,dose_5 == "BNT162b2+BA4/5" ~ dose_5)) 
+
+df <- dat %>%
+  
+  # Filter to pre dose only 
+  filter(time_group == "pre") %>%
+  
+  # Ensure numeric 
+  mutate(across(ends_with("ds10") & starts_with("ic50"),  ~ as.numeric(.x) )) %>%
+  
+  ## Long format
+  pivot_longer(ends_with("ds10") & starts_with("ic50"),
+               values_to = "nAb",
+               names_to = "variant") %>% 
+  
+  # Tidy variant names
+  mutate(variant = str_remove(variant,"_ds10"),
+         variant = str_remove(variant,"ic50_"),
+         variant = str_replace(variant, pattern = "Omicron_BA", replacement = "BA."),
+         variant = str_replace(variant, pattern = "wildtype", replacement = "Ancestral"),
+         variant = factor(variant,levels= strainOrder,ordered = T)) %>% 
+  
+  # Tidy / reorder group and facet labels
+  mutate(cohort = factor(cohort, levels = c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"),labels=c("BNT162b2_BA4/5","BNT162b2-XBB.1.5")),
+         time_group = factor(time_group, levels = c("pre","post"),ordered = T)) %>%
+  
+  # Remove NA's
+  filter(!is.na(nAb)) %>% 
+  
+   # Filt to JN.1 repeats
+  filter(grepl("JN.1",variant),
+         !is.na(variant)) %>% 
+  
+  # Tidy names to align with paper
+  mutate(variant = case_when(variant == "JN.1" ~ "JN.1_Caco.2_b1",T~variant),
+         variant = gsub("_"," ",variant),
+         variant = gsub("Vero.V1 b2","Vero V1",variant),
+         variant = gsub("Caco.2","Caco-2",variant),
+         variant = gsub(" b1","\n(repeat 1)",variant),
+         variant = gsub(" b2","\n(repeat 2)",variant))
+
+# Statistical tests
+stat.test <- df %>%
+  
+  # wilcox test per facet
+  group_by(variant,time_group) %>%
+  rstatix::wilcox_test(nAb ~ cohort,paired = F,ref.group = "BNT162b2_BA4/5")%>%
+  ungroup() %>% 
+  
+  # Format for plotting
+  adjust_pvalue(method = "holm") %>%
+  add_significance() %>%
+  add_xy_position(x = "cohort",fun="median") %>% 
+  mutate(p.lab = format(round(p,3),ns=3),
+         p.lab = gsub("0.000","<0.001",p.lab))
+
+# Plot
+gg<-df %>% 
+  ggplot(aes(x = cohort, y = nAb, group = elig_study_id,  col = variant)) +
+  geom_violin(aes(x = cohort,group=cohort),fill=NA)+
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  scale_y_nAb_ds10(upper_floor = 4) +
+  scale_color_manual(values = manual.pal, drop = T) +
+  theme_bw() + 
+  # Add median
+  stat_summary(aes(group=NULL), geom = "point", shape = 5, size = 2, col = "black",fun = "median") +
+  # Add pre-calculated P values
+  stat_pvalue_manual(stat.test,y.position = 17,label = "p.lab",tip.length = 0.03)+
+  # Facet by variant and time group
+  facet_grid(cols=vars(variant),rows=vars(time_group)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        legend.position="none") +
+  labs(x = "Dose 5 vaccine")
+
+
+panel_JN1_pre_by_dose <-gg + scale_x_discrete(labels=c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"))
+
+```
+
+<!-- ## Figure 3b: JN.1 repeats - Post - monovalent vs bivalent -->
+
+```{r}
+#| label: figure_3b_JN1_post_monovalent_vs_bivalent
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+#| 
+# Faceting by time point (pre/post cohort) and comparing samples by vaccine type (dose_5)
+dat <- rbind(pre.all,post.all) %>%
+  rowwise() %>% 
+  mutate(cohort = case_when(str_detect(cohort, "pre") ~"pre", str_detect(cohort, "post") ~"post"),
+         time_group = cohort,
+         cohort = case_when(dose_5 == "BNT162b2-XBB.1.5" ~ dose_5,dose_5 == "BNT162b2+BA4/5" ~ dose_5)) 
+
+df <- dat %>%
+  
+  # Filter to pre dose only 
+  filter(time_group == "post") %>%
+  
+  # Ensure numeric 
+  mutate(across(ends_with("ds10") & starts_with("ic50"),  ~ as.numeric(.x) )) %>%
+  
+  ## Long format
+  pivot_longer(ends_with("ds10") & starts_with("ic50"),
+               values_to = "nAb",
+               names_to = "variant") %>% 
+  
+  # Tidy variant names
+  mutate(variant = str_remove(variant,"_ds10"),
+         variant = str_remove(variant,"ic50_"),
+         variant = str_replace(variant, pattern = "Omicron_BA", replacement = "BA."),
+         variant = str_replace(variant, pattern = "wildtype", replacement = "Ancestral"),
+         variant = factor(variant,levels= strainOrder,ordered = T)) %>% 
+  
+  # Tidy / reorder group and facet labels
+  mutate(cohort = factor(cohort, levels = c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"),labels=c("BNT162b2_BA4/5","BNT162b2-XBB.1.5")),
+         time_group = factor(time_group, levels = c("pre","post"),ordered = T)) %>%
+  
+  # Remove NA's
+  filter(!is.na(nAb))  %>% 
+  
+  # Filt to JN.1 repeats
+  filter(grepl("JN.1",variant),
+         !is.na(variant)) %>% 
+  
+  # Tidy names to align with paper
+  mutate(variant = case_when(variant == "JN.1" ~ "JN.1_Caco.2_b1",T~variant),
+         variant = gsub("_"," ",variant),
+         variant = gsub("Vero.V1 b2","Vero V1",variant),
+         variant = gsub("Caco.2","Caco-2",variant),
+         variant = gsub(" b1","\n(repeat 1)",variant),
+         variant = gsub(" b2","\n(repeat 2)",variant))
+
+# Statistical tests
+stat.test <- df %>%
+  
+  # wilcox test per facet
+  group_by(variant,time_group) %>%
+  rstatix::wilcox_test(nAb ~ cohort,paired = F,ref.group = "BNT162b2_BA4/5")%>%
+  ungroup() %>% 
+  
+  # Format for plotting
+  adjust_pvalue(method = "holm") %>%
+  add_significance() %>%
+  add_xy_position(x = "cohort",fun="median") %>% 
+  mutate(p.lab = format(round(p,3),ns=3),
+         p.lab = gsub("0.000","<0.001",p.lab))
+
+# Plot
+gg<-df %>% 
+  ggplot(aes(x = cohort, y = nAb, group = elig_study_id,  col = variant)) +
+  geom_violin(aes(x = cohort,group=cohort),fill=NA)+
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  scale_y_nAb_ds10(upper_floor = 4) +
+  scale_color_manual(values = manual.pal, drop = T) +
+  theme_bw() + 
+  # Add median
+  stat_summary(aes(group=NULL), geom = "point", shape = 5, size = 2, col = "black",fun = "median") +
+  # Add pre-calculated P values
+  stat_pvalue_manual(stat.test,y.position = 17,label = "p.lab",tip.length = 0.03)+
+  # Facet by variant and time group
+  facet_grid(cols=vars(variant),rows=vars(time_group)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        legend.position="none") +
+  labs(x = "Dose 5 vaccine")
+
+## Fold Change
+
+# Vector of variants & vaccines
+variants <- names(table(gg$data$variant)[table(gg$data$variant)!=0])
+time_groups <- names(table(gg$data$time_group)[table(gg$data$time_group)!=0])
+
+# Comparison groups 
+num = "BNT162b2-XBB.1.5"
+denom = "BNT162b2_BA4/5"
+
+# Loop through each vax & variant
+FC.ci <- list()
+for(v in time_groups){
+  for(j in 1:length(variants)){
+    y = variants[j]
+    FC.ci[[v]][[j]]<- unpaired_FC(df = df %>% filter(time_group == v),denom = denom,num=num,y=y,rpts = rpts,ci_type = "bca")
+    FC.ci[[v]][[j]]$group2 = num
+    FC.ci[[v]][[j]]$group1 = denom
+    FC.ci[[v]][[j]]$time_group = v
+  }
+}
+FC.ci <- bind_rows(FC.ci)
+colnames(FC.ci) <- gsub(num,"group2_nAb",colnames(FC.ci))
+colnames(FC.ci) <- gsub(denom,"group1_nAb",colnames(FC.ci))
+
+# Add other stats 
+FC.ci <- full_join(FC.ci,stat.test)
+
+FC.labs <- FC.ci %>%
+  ## round to 1 dp ##
+  mutate(across(where(is.numeric),round, 1)) %>%
+  mutate(label = paste0("FC=",med, "\n[",lower_ci, "-",upper_ci, "]"))  %>%
+  mutate(text.label = paste0("FC ",med, " [",lower_ci, "-",upper_ci, "]"))  %>%
+  mutate(x = 1.5) %>%
+  mutate(y.position = 15) %>% 
+  mutate(elig_study_id = NA) %>%
+  mutate(variant = factor(variant,levels= levels(factor(df$variant)),ordered = T),
+         time_group = factor(time_group,levels= c("pre","post"),ordered = T))
+
+
+panel_JN1_post_by_dose <-gg + geom_text(data= FC.labs %>% 
+                      filter(n1>10,p<0.05),
+               aes(x=x, y=y.position, label=label),
+               col="black",
+               size = 8/ggplot2::.pt)+ scale_x_discrete(labels=c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"))
+
+```
+
+<!-- ########################################### -->
+
+<!-- ## Figure S1a: JN.1 - Caco-2 vs Vero V1 -->
+
+```{r}
+#| label: figure_S1a_JN1_caco2_vs_verov1
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+#| 
+dat <- rbind(pre.all, post.all)
+
+df <- dat %>%
+  # Ensure numeric 
+  mutate(across(ends_with("ds10") & starts_with("ic50"),  ~ as.numeric(.x) )) %>%
+  
+  ## Long format
+  pivot_longer(ends_with("ds10") & starts_with("ic50"),
+               values_to = "nAb",
+               names_to = "variant") %>% 
+  
+  # Tidy variant names
+  mutate(variant = str_remove(variant,"_ds10"),
+         variant = str_remove(variant,"ic50_"),
+         variant = str_replace(variant, pattern = "Omicron_BA", replacement = "BA."),
+         variant = str_replace(variant, pattern = "wildtype", replacement = "Ancestral"),
+         variant = factor(variant,levels= strainOrder)) %>% 
+  
+  # Tidy / reorder group and facet labels
+  mutate(cohort = factor(cohort, levels = c("pre.all", "post.all"),labels = c("pre", "post")),
+         dose_5 = factor(dose_5,levels=c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"))) %>%
+  
+  # Remove NA's
+  filter(!is.na(nAb))  %>% 
+  
+  # Filter to JN.1 repeats
+  filter(grepl("JN.1",variant),
+         !is.na(variant)) %>% 
+  
+  mutate(variant = case_when(variant == "JN.1" ~ "JN.1_Caco.2_b1",T~variant)) %>% 
+  
+  
+  # Ensure only paired samples retained
+  group_by(dose_5,elig_study_id,cohort) %>% 
+  filter(n()==3) %>% 
+  ungroup()
+
+
+# Statistical tests
+stat.test <- df %>%
+  
+  # Paired wilcox test per facet
+  # Check arranged by ID
+  arrange(elig_study_id) %>% 
+  group_by(cohort,dose_5) %>%
+  rstatix::wilcox_test(nAb ~ variant,paired = T)%>%
+  
+  # Format for plotting
+  adjust_pvalue(method = "holm") %>%
+  add_significance() %>%
+  add_xy_position(x = "variant",fun="median") %>% 
+  mutate(p.lab = format(round(p,3),ns=3),
+         p.lab = gsub("0.000","<0.001",p.lab))
+
+
+
+
+gg<-df %>% 
+  ggplot(aes(x = variant, y = nAb, group = elig_study_id)) +
+  geom_line(col = "lightgrey", position = pd) +
+  geom_violin(aes(x = variant, group = variant),fill=NA)+
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  #ggbeeswarm::geom_quasirandom(shape=20, size = 2, alpha=0.4, position = pd,width = 0.25) +
+  scale_y_nAb_ds10(upper_floor = 6) +
+  scale_color_manual(values = manual.pal, drop = T) +
+  theme_bw() + 
+  # Add median
+  stat_summary(aes(group=NULL), geom = "point", shape = 5, size = 2, col = "black",fun = "median") +
+  # Add pre-calculated P values
+  stat_pvalue_manual(stat.test,size=3,
+                     y.position = 16,
+                     label = "p.lab",
+                     tip.length = 0.02,
+                     step.increase = 0.12,
+                     step.group.by = c("cohort","dose_5"))+
+  # Facet by cohort and vaccine type
+  facet_grid(cols = vars(cohort),rows=vars(dose_5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        legend.position="none") +
+  labs(x = "Batch")
+
+# Update x-axis labels to align with text 
+tmp <- gsub("_"," ",names(table(df$variant)))
+tmp <- gsub("Vero.V1 b2","Vero V1",tmp)
+tmp <- gsub("Caco.2","Caco-2",tmp)
+tmp <- gsub(" b1","\n(repeat 1)",tmp)
+tmp <- gsub(" b2","\n(repeat 2)",tmp)
+
+panel_batch_vs_batch_paired <-  gg + scale_x_discrete(labels = tmp)
+
+
+```
+
+<!-- ## Figure S1b-c: JN.1 - correlation -->
+
+```{r}
+#| label: figure_S1a_JN1_caco2_vs_verov1
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: true
+#| 
+
+dat <- rbind(pre.all, post.all)
+
+df <- dat %>%
+  mutate(across(ends_with("ds10") & starts_with("ic50"),  ~ as.numeric(.x))) %>% 
+  mutate(cohort = factor(cohort, levels = c("pre.all", "post.all"),labels = c("pre", "post"))) %>% 
+  rename(JN.1_Caco.2_b1 = ic50_JN.1_ds10,
+         JN.1_Caco.2_b2 = ic50_JN.1_Caco.2_b2_ds10,
+         JN.1_Vero.V1_b2 = ic50_JN.1_Vero.V1_b2_ds10) %>% 
+  mutate(dose_5 = factor(dose_5,levels = c("BNT162b2+BA4/5","BNT162b2-XBB.1.5"),ordered = T))
+
+
+# Correlation of Caco-2  repeats 1 & 2
+panel_correl_b1vb2 <- df %>% 
+  ggplot(aes(x = JN.1_Caco.2_b1, y = JN.1_Caco.2_b2)) +
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  # Linear trend line
+  geom_smooth(method="lm",colour="black",alpha=0.5) +
+  # Spearman correlation
+  stat_cor(method = "spearman",p.accuracy = 0.001,colour="black",
+           label.x.npc = "left",
+           label.y.npc = "top",show.legend = F,size=3)+
+  scale_y_nAb_ds10(upper_floor = 4, 
+                   y_lab =  bquote('JN.1 Caco-2 (repeat 2) Neutralisation,'~IC[50]~'')) +
+  scale_x_nAb_ds10(upper_floor = 1,
+                   x_lab =  bquote('JN.1 Caco-2 (repeat 1) Neutralisation,'~IC[50]~'')) +
+  theme_bw() +
+  # Facet by pre/post and vaccine type
+  facet_grid(cols=vars(cohort),rows=vars(dose_5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        legend.position="none") 
+
+
+# Correlation of Caco-2 repeat 1 & Vero V1
+panel_correl_b1vb2_vero <-df %>% 
+  ggplot(aes(x = JN.1_Caco.2_b1, y = JN.1_Vero.V1_b2)) +
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  # Linear trend line
+  geom_smooth(method="lm",colour="black",alpha=0.5) +
+  # Spearman correlation
+  stat_cor(method = "spearman",p.accuracy = 0.001,colour="black",
+           label.x.npc = "left",
+           label.y.npc = "top",show.legend = F,size=3)+
+  scale_y_nAb_ds10(upper_floor = 4, 
+                   y_lab =  bquote('JN.1 Vero V1  Neutralisation,'~IC[50]~'')) +
+  scale_x_nAb_ds10(upper_floor = 1,x_lab =  bquote('JN.1 Caco-2 (repeat 1) Neutralisation,'~IC[50]~'')) +
+  theme_bw() +
+  # Facet by pre/post and vaccine type
+  facet_grid(cols=vars(cohort),rows=vars(dose_5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        legend.position="none") 
+
+
+# Correlation of Caco-2 repeat 2 & Vero V1
+
+panel_correl_b2vb2_vero <-df %>% 
+  ggplot(aes(x = JN.1_Caco.2_b2, y = JN.1_Vero.V1_b2)) +
+  geom_point(shape=20, size = 2, alpha=0.4, position = pd) +
+  # Linear trend line
+  geom_smooth(method="lm",colour="black",alpha=0.5) +
+  # Spearman correlation
+  stat_cor(method = "spearman",p.accuracy = 0.001,colour="black",
+           label.x.npc = "left",
+           label.y.npc = "top",show.legend = F,size=3)+
+  scale_y_nAb_ds10(upper_floor = 4, 
+                   y_lab =  bquote('JN.1 Vero V1  Neutralisation,'~IC[50]~'')) +
+  scale_x_nAb_ds10(upper_floor = 1,x_lab =  bquote('JN.1 Caco-2 (repeat 2) Neutralisation,'~IC[50]~'')) +
+  theme_bw() +
+  # Facet by pre/post and vaccine type
+  facet_grid(cols=vars(cohort),rows=vars(dose_5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        legend.position="none") 
+
+```
